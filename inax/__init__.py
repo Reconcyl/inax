@@ -58,11 +58,16 @@ class _Stream:
 
 
 class _Promise:
-    def __init__(self, src, tracked_id, do_compute, f, f_args, f_kwargs):
+    def __init__(self, src, tracked_id, do_compute, evict_key, f, f_args, f_kwargs):
+        self.resolved = False
+        assert isinstance(src, str)
+        assert isinstance(tracked_id, int)
+        assert isinstance(do_compute, bool)
+        assert isinstance(evict_key, str)
         self.src = src
         self.tracked_id = tracked_id
-        self.resolved = False
         self._do_compute = do_compute
+        self._evict_key = evict_key
         self._stream_param = (f_args, f_kwargs)
         self._cache_args = (f_args, tuple(sorted(f_kwargs.items())))
         self._stream = _Stream(f)
@@ -77,7 +82,7 @@ class _Promise:
         assert not self.resolved
         if self._cache_args:
             try:
-                res = cache.lookup(self.src, *self._cache_args)
+                res = cache.lookup(self.src, *self._cache_args, self._evict_key)
                 self._resolve()
                 return res
             except KeyError:
@@ -97,7 +102,7 @@ class _Promise:
                 res = None
             else:
                 res = e.args[0]
-            cache.insert(self.src, *self._cache_args, res)
+            cache.insert(self.src, *self._cache_args, res, self._evict_key)
             self._resolve()
             return res
 
@@ -143,29 +148,30 @@ class _Cache:
             if not subcache.is_empty()
         }}
 
-    def lookup(self, name, args, kwargs):
+    def lookup(self, name, args, kwargs, evict_key=None):
         assert isinstance(kwargs, tuple)
-        return self._names[name].lookup(args, kwargs)
+        return self._names[name].lookup(args, kwargs, evict_key)
 
     def _get_subcache(self, name):
         if name not in self._names:
             self._names[name] = _NameSubcache.empty()
         return self._names[name]
 
-    def insert(self, name, args, kwargs, res):
+    def insert(self, name, args, kwargs, res, evict_key=None):
         assert isinstance(kwargs, tuple)
-        self._get_subcache(name).insert(args, kwargs, res)
+        self._get_subcache(name).insert(args, kwargs, res, evict_key)
 
 
 class _NameSubcache:
-    def __init__(self, entries):
+    def __init__(self, entries, evict_key):
         self.entries = entries
+        self._evict_key = evict_key
 
     def empty():
-        return _NameSubcache({})
+        return _NameSubcache({}, None)
 
     def is_empty(self):
-        return len(self.entries) == 0
+        return len(self.entries) == 0 and not self._evict_key
 
     def from_json(json_value, *, name, from_json_fn):
         entries = {}
@@ -180,20 +186,33 @@ class _NameSubcache:
                 "duplicate cache entries for '{}': args={}, kwargs={}" \
                     .format(name, k[0], k[1])
             entries[k] = entry.res
-        return _NameSubcache(entries)
+        evict_key = json_value.get("ev", "")
+        return _NameSubcache(entries, evict_key)
 
     def to_json(self, *, name, to_json_fn):
-        return {"entries": [
+        res = {"entries": [
             _Entry(args, kwargs, res).to_json(name=name, to_json_fn=to_json_fn)
             for (args, kwargs), res in self.entries.items()
         ]}
+        if self._evict_key:
+            res["ev"] = self._evict_key
+        return res
 
-    def lookup(self, args, kwargs):
+    def _check_evict(self, evict_key):
+        if self._evict_key is None:
+            self._evict_Key = evict_key
+        elif not (evict_key is None or evict_key == self._evict_key):
+            self._evict_key = evict_key
+            self.entries = {}
+
+    def lookup(self, args, kwargs, evict_key=None):
         assert isinstance(kwargs, tuple)
+        self._check_evict(evict_key)
         return self.entries[(args, kwargs)]
 
-    def insert(self, args, kwargs, res):
+    def insert(self, args, kwargs, res, evict_key=None):
         assert isinstance(kwargs, tuple)
+        self._check_evict(evict_key)
         k = (args, kwargs)
         assert k not in self.entries, "value {} is already in cache".format(k)
         self.entries[k] = res
@@ -292,7 +311,7 @@ class Context:
 
 
 _num_tracked = 0
-def _track(name=None, compute=True):
+def _track(name=None, compute=True, evict_key=""):
     def decorate(f):
         global _num_tracked
         tracked_id = _num_tracked
@@ -300,7 +319,7 @@ def _track(name=None, compute=True):
         @functools.wraps(f)
         def wrapper(*args, **kwargs):
             src = f.__name__ if name is None else name
-            return _Promise(src, tracked_id, compute, f, args, kwargs)
+            return _Promise(src, tracked_id, compute, evict_key, f, args, kwargs)
         return wrapper
     return decorate
 
